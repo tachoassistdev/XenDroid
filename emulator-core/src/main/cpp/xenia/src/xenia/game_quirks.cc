@@ -46,6 +46,10 @@ static const Quirk kQuirks[] = {
     {0x4E4D080B, "readback_resolve", "none",
      "no resolve readback needed; avoids uma GPU drains"},
     {0x4E4D080B, "occlusion_query", "fake", "verified setting"},
+    {0x4E4D080B, "mount_cache", true, "verified setting"},
+    {0x4E4D080B, "mount_scratch", true, "verified setting"},
+    {0x4E4D080B, "adrenotools_force_max_clocks", true,
+     "verified setting (custom driver only)"},
 };
 
 // Same path/priority as a per-game config file.
