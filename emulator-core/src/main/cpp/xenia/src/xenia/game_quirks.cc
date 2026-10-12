@@ -38,6 +38,14 @@ static const Quirk kQuirks[] = {
     {0x49470804, "network_enabled", false, "hangs on a blocking recvfrom"},
     {0x4E4D083A, "spirv_multiply_zero_test_on_bits", true,
      "ir3 cannot compile fmadz"},
+    // Magna Carta 2: the set a player verified on Adreno 740 + Turnip to clear
+    // the boot-logo / loading-screen flicker and the missing main character
+    // model. Per-title so other games keep the cheaper global defaults.
+    {0x4E4D080B, "clear_memory_page_state", true,
+     "missing character model and flicker"},
+    {0x4E4D080B, "readback_resolve", "none",
+     "no resolve readback needed; avoids uma GPU drains"},
+    {0x4E4D080B, "occlusion_query", "fake", "verified setting"},
 };
 
 // Same path/priority as a per-game config file.
