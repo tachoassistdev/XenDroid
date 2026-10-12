@@ -504,13 +504,22 @@ StringBuffer* thread_local_string_buffer();
 template <typename Tuple>
 XE_NOALIAS void PrintKernelCall(cpu::Export* export_entry,
                                 const Tuple& params) {
+  const bool important =
+      (export_entry->tags & xe::cpu::ExportTag::kImportant) != 0;
+  // Formatting every argument costs far more than the call it describes, and
+  // at the default log level the line is dropped anyway: decide first.
+  if (!xe::logging::ShouldLog(
+          important ? xe::LogLevel::Info : xe::LogLevel::Debug,
+          xe::LogSrc::Kernel)) {
+    return;
+  }
   auto& string_buffer = *thread_local_string_buffer();
   string_buffer.Reset();
   string_buffer.Append(export_entry->name);
   string_buffer.Append('(');
   AppendKernelCallParams(string_buffer, export_entry, params);
   string_buffer.Append(')');
-  if (export_entry->tags & xe::cpu::ExportTag::kImportant) {
+  if (important) {
     xe::logging::AppendLogLine(xe::LogLevel::Info, 'i',
                                string_buffer.to_string_view(), LogSrc::Kernel);
   } else {
