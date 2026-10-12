@@ -20,6 +20,10 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xthread.h"
 
+#if XE_ARCH_AMD64 == 1
+#include <immintrin.h>
+#endif
+
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
@@ -593,6 +597,14 @@ static void CriticalSectionPrefetchW(const void* vp) {
 #endif
 }
 
+static inline void CriticalSectionSpinHint() {
+#if XE_ARCH_AMD64 == 1
+  _mm_pause();
+#elif XE_ARCH_ARM64 == 1
+  __asm__ volatile("yield" ::: "memory");
+#endif
+}
+
 void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
   if (!cs.guest_address()) {
     XELOGE("Null critical section in RtlEnterCriticalSection!");
@@ -609,8 +621,15 @@ void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
     return;
   }
 
-  // Spin loop
+  // Spin loop. Test before the CAS: a CAS on a held lock still takes the
+  // line exclusive, so every spinner would keep stealing it from the owner
+  // (and from the leave that would release it).
+  volatile int32_t* lock_count = &cs->lock_count;
   while (spin_count--) {
+    if (*lock_count != -1) {
+      CriticalSectionSpinHint();
+      continue;
+    }
     if (xe::atomic_cas(-1, 0, &cs->lock_count)) {
       // Acquired.
       cs->owning_thread = cur_thread;
