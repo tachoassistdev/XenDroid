@@ -11,7 +11,7 @@ on:
     branches-ignore: main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-debug-apk:
@@ -99,3 +99,15 @@ jobs:
         name: XenDroid_Debug_${{ steps.git.outputs.hash }}
         path: XenDroid_Debug_${{ steps.git.outputs.hash }}.apk
         retention-days: 14
+
+    # Artifacts download as a zip and need a GitHub login; a prerelease asset
+    # is a plain .apk link that opens straight from a phone's browser.
+    - name: Publish as prerelease
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: debug-${{ github.ref_name }}
+        name: Debug build (${{ github.ref_name }})
+        prerelease: true
+        target_commitish: ${{ github.sha }}
+        body: Latest debug APK from branch ${{ github.ref_name }}, commit ${{ steps.git.outputs.hash }}. Installs as xendroid.compose.debug, next to the normal app.
+        files: XenDroid_Debug_${{ steps.git.outputs.hash }}.apk
