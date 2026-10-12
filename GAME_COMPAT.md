@@ -49,6 +49,23 @@ depth_float24_convert_in_pixel_shader = true
   playable (the separate job-system freeze was a code fix — FIFO semaphore,
   commit 5b4113562).
 
+### Magna Carta 2 — `4E4D080B`
+
+Applied automatically by `game_quirks.cc`, no per-game file needed (verified
+by a player on AYN Thor Pro, Adreno 740 + Turnip):
+
+```toml
+[GPU]
+clear_memory_page_state = true   # missing main character model, logo/loading flicker
+readback_resolve = "none"
+occlusion_query = "fake"
+```
+
+A per-game config still overrides any of these. Performance notes, the
+benchmark procedure and the experiments still to run on device are in
+`docs/magna-carta-2-thor-pro.md`. `log_shared_memory_uploads = true` shows what
+`clear_memory_page_state` costs per frame here.
+
 ### Fable II — `4D5307F1`
 
 No special configuration needed (as of 2026-06-13). The title previously
