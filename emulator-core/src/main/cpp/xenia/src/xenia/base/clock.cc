@@ -9,6 +9,7 @@
 
 #include "xenia/base/clock.h"
 
+#include <atomic>
 #include <mutex>
 
 #include "xenia/base/assert.h"
@@ -44,16 +45,84 @@ uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
 // Computed by RecomputeGuestTickScalar.
 std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
 
-// Native guest ticks.
+// Guest ticks are a linear function of host ticks between ratio changes:
+//   guest = anchor_guest + (host - anchor_host) * ratio
+// Each read evaluates that from the anchor instead of accumulating a truncated
+// delta under a lock. The old accumulation dropped up to (den - 1) / den of a
+// tick on every call, so the guest clock ran slow in proportion to how often
+// the title read it, and every mftb took a process-wide mutex.
+// The anchor only moves when the ratio changes (startup, time scalar), under
+// tick_mutex_; readers take a seqlock snapshot and never block.
+struct GuestClockAnchor {
+  std::atomic<uint64_t> host;
+  std::atomic<uint64_t> guest;
+  std::atomic<uint64_t> numerator;
+  std::atomic<uint64_t> denominator;
+};
+static GuestClockAnchor guest_clock_anchor_ = {
+    Clock::QueryHostTickCount(), 0, 1, 1};
+// Odd while the anchor is being rewritten.
+static std::atomic<uint32_t> guest_clock_anchor_seq_{0};
+
+// Most recent guest tick count handed out, for GetGuestTickCountPointer.
 uint64_t last_guest_tick_count_ = 0;
-// Last sampled host tick count.
-uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
 
 using tick_mutex_type = std::mutex;
 
-// Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
-// std::mutex tick_mutex_;
+// Serializes anchor and ratio writers. Readers do not take it.
 static tick_mutex_type tick_mutex_;
+
+// floor(delta * num / den) without the 64-bit overflow of the product.
+static inline uint64_t ScaleTicks(uint64_t delta, uint64_t num,
+                                  uint64_t den) {
+  return (delta / den) * num + (delta % den) * num / den;
+}
+
+static inline uint64_t GuestTicksAtHost(uint64_t host_tick_count) {
+  uint64_t anchor_host, anchor_guest, num, den;
+  uint32_t seq;
+  do {
+    seq = guest_clock_anchor_seq_.load(std::memory_order_acquire);
+    anchor_host = guest_clock_anchor_.host.load(std::memory_order_relaxed);
+    anchor_guest = guest_clock_anchor_.guest.load(std::memory_order_relaxed);
+    num = guest_clock_anchor_.numerator.load(std::memory_order_relaxed);
+    den = guest_clock_anchor_.denominator.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+  } while ((seq & 1) ||
+           seq != guest_clock_anchor_seq_.load(std::memory_order_relaxed));
+  uint64_t host_tick_delta =
+      host_tick_count > anchor_host ? host_tick_count - anchor_host : 0;
+  return anchor_guest + ScaleTicks(host_tick_delta, num, den);
+}
+
+// Caller holds tick_mutex_. Re-anchors at the current host time so the guest
+// clock stays continuous across the ratio change.
+static void SetGuestTickRatioLocked(std::pair<uint64_t, uint64_t> ratio) {
+  uint32_t seq = guest_clock_anchor_seq_.load(std::memory_order_relaxed);
+  guest_clock_anchor_seq_.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  // Sampled only now that readers are held off: any value a reader computed
+  // with the old anchor used a host time no later than this one, so the guest
+  // clock cannot step backwards when the new ratio is smaller.
+  uint64_t host_tick_count = Clock::QueryHostTickCount();
+  uint64_t anchor_host =
+      guest_clock_anchor_.host.load(std::memory_order_relaxed);
+  uint64_t host_tick_delta =
+      host_tick_count > anchor_host ? host_tick_count - anchor_host : 0;
+  uint64_t guest_tick_count =
+      guest_clock_anchor_.guest.load(std::memory_order_relaxed) +
+      ScaleTicks(host_tick_delta,
+                 guest_clock_anchor_.numerator.load(std::memory_order_relaxed),
+                 guest_clock_anchor_.denominator.load(
+                     std::memory_order_relaxed));
+  guest_clock_anchor_.host.store(host_tick_count, std::memory_order_relaxed);
+  guest_clock_anchor_.guest.store(guest_tick_count, std::memory_order_relaxed);
+  guest_clock_anchor_.numerator.store(ratio.first, std::memory_order_relaxed);
+  guest_clock_anchor_.denominator.store(ratio.second,
+                                        std::memory_order_relaxed);
+  guest_clock_anchor_seq_.store(seq + 2, std::memory_order_release);
+  guest_tick_ratio_ = ratio;
+}
 
 void RecomputeGuestTickScalar() {
   // Create a rational number with numerator (first) and denominator (second)
@@ -72,11 +141,10 @@ void RecomputeGuestTickScalar() {
   reduce_fraction(frac);
 
   std::lock_guard<tick_mutex_type> lock(tick_mutex_);
-  guest_tick_ratio_ = frac;
+  SetGuestTickRatioLocked(frac);
 }
 
-// Update the guest timer for all threads.
-// Return a copy of the value so locking is reduced.
+// Current guest tick count. Lock-free.
 uint64_t UpdateGuestClock() {
   uint64_t host_tick_count = Clock::QueryHostTickCount();
 
@@ -85,22 +153,14 @@ uint64_t UpdateGuestClock() {
     return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
   }
 
-  std::unique_lock<tick_mutex_type> lock(tick_mutex_, std::defer_lock);
-  if (lock.try_lock()) {
-    // Translate host tick count to guest tick count.
-    uint64_t host_tick_delta = host_tick_count > last_host_tick_count_
-                                   ? host_tick_count - last_host_tick_count_
-                                   : 0;
-    last_host_tick_count_ = host_tick_count;
-    uint64_t guest_tick_delta =
-        host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
-    last_guest_tick_count_ += guest_tick_delta;
-    return last_guest_tick_count_;
-  } else {
-    // Wait until another thread has finished updating the clock.
-    lock.lock();
-    return last_guest_tick_count_;
+  uint64_t guest_tick_count = GuestTicksAtHost(host_tick_count);
+  // Only consumed by the x64 inline mftb path; a racing older value is
+  // harmless there, so no CAS loop to contend on.
+  std::atomic_ref<uint64_t> last(last_guest_tick_count_);
+  if (guest_tick_count > last.load(std::memory_order_relaxed)) {
+    last.store(guest_tick_count, std::memory_order_relaxed);
   }
+  return guest_tick_count;
 }
 
 // Offset of the current guest system file time relative to the guest base time.
