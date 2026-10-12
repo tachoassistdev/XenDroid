@@ -1,0 +1,101 @@
+name: XenDroid debug APK
+
+# Installable debug build (applicationId compose.compose.debug, signed with the
+# Gradle debug key) for testing branches on a device. Needs no secrets, unlike
+# XenDroid.yml, so it also runs on forks. The native code is built with the
+# same -O2 flags as release (emulator-core/build.gradle), so it is fine for
+# performance testing.
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore: main
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-24.04
+
+    container:
+      image: ghcr.io/cirruslabs/android-sdk:35
+
+    env:
+      ANDROID_NDK_VERSION: 29.0.14206865
+      GRADLE_OPTS: -Dorg.gradle.daemon=false
+      USE_CCACHE: 'true'
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 1
+
+    - name: Configure Git
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+    - name: Install tools
+      run: |
+        apt-get update
+        apt-get install -y ninja-build python3 glslang-tools spirv-tools
+
+    - name: Cache Gradle
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-home-cache-strict-match: false
+        validate-wrappers: false
+
+    - name: Cache NDK + CMake
+      uses: actions/cache@v4
+      with:
+        path: |
+          /opt/android-sdk-linux/ndk/${{ env.ANDROID_NDK_VERSION }}
+          /opt/android-sdk-linux/cmake/3.30.3
+        key: sdk-ndk${{ env.ANDROID_NDK_VERSION }}-cmake3.30.3
+
+    - name: Install Android NDK and CMake
+      run: |
+        export ANDROID_SDK_ROOT=/opt/android-sdk-linux
+        yes | sdkmanager --licenses > /dev/null
+        if [ ! -d "$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" ]; then
+          sdkmanager "ndk;$ANDROID_NDK_VERSION"
+        fi
+        if [ ! -d "$ANDROID_SDK_ROOT/cmake/3.30.3" ]; then
+          sdkmanager "cmake;3.30.3"
+        fi
+        echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+        echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+        echo "cmake.dir=$ANDROID_SDK_ROOT/cmake/3.30.3" >> local.properties
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-ndk${{ env.ANDROID_NDK_VERSION }}-arm64-debug
+        max-size: 2G
+
+    - name: Get Git hash
+      id: git
+      run: echo "hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Build debug APK
+      run: |
+        chmod +x gradlew
+        ./gradlew :app:assembleDebug \
+          -PgitHash=${{ steps.git.outputs.hash }} \
+          --max-workers=$(nproc) \
+          --no-daemon
+
+    - name: Rename APK
+      run: |
+        APK=$(ls app/build/outputs/apk/debug/*.apk | head -n 1)
+        mv "$APK" "XenDroid_Debug_${{ steps.git.outputs.hash }}.apk"
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: XenDroid_Debug_${{ steps.git.outputs.hash }}
+        path: XenDroid_Debug_${{ steps.git.outputs.hash }}.apk
+        retention-days: 14
