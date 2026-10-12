@@ -10,6 +10,9 @@
 #ifndef XENIA_GPU_SHARED_MEMORY_H_
 #define XENIA_GPU_SHARED_MEMORY_H_
 
+#include <memory>
+#include <vector>
+
 #include "xenia/memory.h"
 
 namespace xe {
@@ -33,6 +36,12 @@ class SharedMemory {
   // Call when a new GPU submission starts recording; resets the tracking of
   // pages invalidated while the submission was open.
   void OnGpuSubmissionOpened();
+
+  // Call once per closed guest frame. Accounts and, with
+  // log_shared_memory_uploads, logs (about once a second) how much guest
+  // memory was copied to the GPU per frame, and how much of it was only
+  // re-uploaded because clear_memory_page_state's refresh invalidated it.
+  void OnFrameClosed();
 
   typedef void (*GlobalWatchCallback)(
       const global_unique_lock_type& global_lock, void* context,
@@ -174,6 +183,37 @@ class SharedMemory {
       const std::pair<uint32_t, uint32_t>* upload_page_ranges,
       uint32_t num_upload_ranges) = 0;
 
+  // Refresh-upload bookkeeping for UploadRanges implementations. A page is
+  // "refresh-only" when the last thing that invalidated it was
+  // SetSystemPageBlocksValidWithGpuDataWritten: CPU write faults and GPU writes
+  // since the last upload clear that state. Its last uploaded bytes are known
+  // by hash only with clear_memory_page_state_skip_unchanged.
+  bool refresh_upload_tracking_enabled() const;
+  bool refresh_upload_skip_enabled() const;
+  // Collects, for the pages [page_first, page_first + page_count), which are
+  // refresh-only (and, if require_hash, also have a known content hash). Must
+  // be called before MakeRangeValid for the pages, which resets the state.
+  void SnapshotRefreshOnlyPages(uint32_t page_first, uint32_t page_count,
+                                bool require_hash,
+                                std::vector<uint64_t>& bits_out) const;
+  // Whether the guest page still holds the bytes last uploaded for it. The
+  // page must be host-readable and already made valid (so a racing CPU write
+  // invalidates it again instead of being missed).
+  bool PageMatchesUploadedContent(uint32_t page) const;
+  // Records the bytes sent to the GPU for consecutive pages.
+  void RecordUploadedContent(uint32_t page_first, uint32_t page_count,
+                             const uint8_t* data);
+  // Re-marks the content hash as current for pages whose upload was skipped
+  // because PageMatchesUploadedContent held (MakeRangeValid had reset it).
+  void KeepUploadedContent(uint32_t page_first, uint32_t page_count);
+  void ForgetUploadedContent(uint32_t page_first, uint32_t page_count);
+  void AccountUpload(uint64_t uploaded_bytes, uint64_t refresh_bytes,
+                     uint64_t skipped_bytes) {
+    stat_uploaded_bytes_ += uploaded_bytes;
+    stat_refresh_uploaded_bytes_ += refresh_bytes;
+    stat_refresh_skipped_bytes_ += skipped_bytes;
+  }
+
   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
     return trace_download_ranges_;
   }
@@ -241,6 +281,27 @@ class SharedMemory {
   // Pages invalidated since the current GPU submission opened - cleared by
   // OnGpuSubmissionOpened.
   uint64_t* system_page_flags_invalidated_in_submission_ = nullptr;
+
+  // Pages last invalidated by the clear_memory_page_state refresh and nothing
+  // else since their last upload.
+  uint64_t* system_page_flags_refresh_only_ = nullptr;
+  // Pages whose last uploaded bytes are recorded in page_content_hashes_.
+  uint64_t* system_page_flags_content_hashed_ = nullptr;
+  // Allocated on first use, only with clear_memory_page_state_skip_unchanged.
+  std::unique_ptr<uint64_t[]> page_content_hashes_;
+
+  // Clears refresh-only and content-hashed state for the masked pages of a
+  // flags entry. Caller holds the global critical region.
+  void ForgetPageContentLocked(uint32_t block, uint64_t mask) {
+    system_page_flags_refresh_only_[block] &= ~mask;
+    system_page_flags_content_hashed_[block] &= ~mask;
+  }
+
+  uint64_t stat_uploaded_bytes_ = 0;
+  uint64_t stat_refresh_uploaded_bytes_ = 0;
+  uint64_t stat_refresh_skipped_bytes_ = 0;
+  uint32_t stat_frames_ = 0;
+  uint64_t stat_last_log_ms_ = 0;
 
   // Set when GPU-written flags change, so an unchanged frame skips the copy.
   bool gpu_written_data_dirty_ = false;

@@ -6707,6 +6707,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   }
 
   if (is_closing_frame) {
+    shared_memory_->OnFrameClosed();
     if (cvars::clear_memory_page_state) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }

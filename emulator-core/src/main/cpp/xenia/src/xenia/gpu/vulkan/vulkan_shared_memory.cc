@@ -828,9 +828,9 @@ bool VulkanSharedMemory::UploadRanges(
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
 
-  // Uploads one span of pages that is known host-readable.
-  auto upload_span = [&](uint32_t upload_range_start,
-                         uint32_t upload_range_length) -> bool {
+  // Copies one run of pages that is known host-readable.
+  auto copy_run = [&](uint32_t upload_range_start,
+                      uint32_t upload_range_length) -> bool {
     while (upload_range_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
@@ -844,6 +844,13 @@ bool VulkanSharedMemory::UploadRanges(
       }
       MakeRangeValid(upload_range_start << page_size_log2(),
                      uint32_t(upload_buffer_size), false);
+      // Hashed from guest memory before the copy: a CPU write racing the copy
+      // can then only make the hash stale (a later needless upload), never
+      // vouch for bytes the GPU did not receive.
+      RecordUploadedContent(
+          upload_range_start, uint32_t(upload_buffer_size >> page_size_log2()),
+          memory().TranslatePhysical<const uint8_t*>(upload_range_start
+                                                     << page_size_log2()));
 
       if (upload_buffer_size < (1ULL << 32) && upload_buffer_size > 8192) {
         memory::vastcpy(
@@ -874,6 +881,67 @@ bool VulkanSharedMemory::UploadRanges(
           uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
+    }
+    return true;
+  };
+
+  // Uploads one span of pages that is known host-readable. With
+  // clear_memory_page_state, pages only the refresh invalidated may be skipped
+  // when their bytes are unchanged (clear_memory_page_state_skip_unchanged),
+  // and are counted for log_shared_memory_uploads.
+  auto upload_span = [&](uint32_t span_start, uint32_t span_length) -> bool {
+    if (!refresh_upload_tracking_enabled()) {
+      AccountUpload(uint64_t(span_length) << page_size_log2(), 0, 0);
+      return copy_run(span_start, span_length);
+    }
+    SnapshotRefreshOnlyPages(span_start, span_length, false,
+                             refresh_only_bits_);
+    skip_bits_.assign(refresh_only_bits_.size(), 0);
+    bool any_skip = false;
+    if (refresh_upload_skip_enabled()) {
+      SnapshotRefreshOnlyPages(span_start, span_length, true, skip_bits_);
+      for (uint64_t word : skip_bits_) {
+        any_skip |= word != 0;
+      }
+    }
+    if (any_skip) {
+      // Valid (and watched) before hashing, as before a copy: a CPU write
+      // racing the hash invalidates the page again rather than being lost.
+      MakeRangeValid(span_start << page_size_log2(),
+                     span_length << page_size_log2(), false);
+      for (uint32_t i = 0; i < span_length; ++i) {
+        uint64_t bit = uint64_t(1) << (i & 63);
+        if ((skip_bits_[i >> 6] & bit) &&
+            !PageMatchesUploadedContent(span_start + i)) {
+          skip_bits_[i >> 6] &= ~bit;
+        }
+      }
+    }
+    auto test = [](const std::vector<uint64_t>& bits, uint32_t i) {
+      return (bits[i >> 6] >> (i & 63)) & 1;
+    };
+    uint32_t run_first = 0;
+    while (run_first < span_length) {
+      bool skip = test(skip_bits_, run_first);
+      uint32_t run_end = run_first + 1;
+      uint32_t refresh_pages = uint32_t(test(refresh_only_bits_, run_first));
+      while (run_end < span_length && test(skip_bits_, run_end) == skip) {
+        refresh_pages += uint32_t(test(refresh_only_bits_, run_end));
+        ++run_end;
+      }
+      uint32_t run_length = run_end - run_first;
+      if (skip) {
+        // The buffer already holds exactly these bytes.
+        KeepUploadedContent(span_start + run_first, run_length);
+        AccountUpload(0, 0, uint64_t(run_length) << page_size_log2());
+      } else {
+        AccountUpload(uint64_t(run_length) << page_size_log2(),
+                      uint64_t(refresh_pages) << page_size_log2(), 0);
+        if (!copy_run(span_start + run_first, run_length)) {
+          return false;
+        }
+      }
+      run_first = run_end;
     }
     return true;
   };

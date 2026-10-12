@@ -11,8 +11,28 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/bit_range.h"
+#include "xenia/base/clock.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
+
+DECLARE_bool(clear_memory_page_state);
+DECLARE_bool(gpu_allow_invalid_upload_range);
+
+DEFINE_bool(log_shared_memory_uploads, false,
+            "Log, about once a second, how many bytes of guest memory are "
+            "copied to the GPU per frame, and how many of them were only "
+            "re-uploaded because clear_memory_page_state invalidated them.",
+            "GPU");
+DEFINE_bool(
+    clear_memory_page_state_skip_unchanged, false,
+    "Experimental. With clear_memory_page_state, skip re-uploading a page the "
+    "refresh invalidated if its guest bytes still hash equal to what was last "
+    "uploaded for it. Pages the CPU or GPU wrote since are always uploaded. "
+    "Does not help, and may undo the fix, if a title needs the refresh to "
+    "overwrite GPU-side writes the emulator does not track.",
+    "GPU");
 
 namespace xe {
 namespace gpu {
@@ -28,10 +48,12 @@ bool SharedMemory::InitializeCommon() {
       ((kBufferSize >> page_size_log2_) + 63) / 64;
   num_system_page_flags_ = static_cast<uint32_t>(num_system_page_flags_entries);
 
-  // Three flag arrays (valid, valid_and_gpu_written,
-  // invalidated_in_submission), 8 bytes per 64-page entry.
+  // Five flag arrays (valid, valid_and_gpu_written,
+  // invalidated_in_submission, refresh_only, content_hashed), 8 bytes per
+  // 64-page entry.
+  constexpr size_t kFlagArrayCount = 5;
   uint64_t* system_page_flags_base = (uint64_t*)memory::AllocFixed(
-      nullptr, num_system_page_flags_ * 3 * sizeof(uint64_t),
+      nullptr, num_system_page_flags_ * kFlagArrayCount * sizeof(uint64_t),
       memory::AllocationType::kReserveCommit, memory::PageAccess::kReadWrite);
 
   if (!system_page_flags_base) {
@@ -44,8 +66,13 @@ bool SharedMemory::InitializeCommon() {
       system_page_flags_base + num_system_page_flags_;
   system_page_flags_invalidated_in_submission_ =
       system_page_flags_base + 2 * num_system_page_flags_;
+  system_page_flags_refresh_only_ =
+      system_page_flags_base + 3 * num_system_page_flags_;
+  system_page_flags_content_hashed_ =
+      system_page_flags_base + 4 * num_system_page_flags_;
 
-  memset(system_page_flags_base, 0, 3 * 8 * num_system_page_flags_entries);
+  memset(system_page_flags_base, 0,
+         kFlagArrayCount * 8 * num_system_page_flags_entries);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(
@@ -110,6 +137,9 @@ void SharedMemory::ShutdownCommon() {
 
   system_page_flags_valid_and_gpu_written_ = nullptr;
   system_page_flags_invalidated_in_submission_ = nullptr;
+  system_page_flags_refresh_only_ = nullptr;
+  system_page_flags_content_hashed_ = nullptr;
+  page_content_hashes_.reset();
   num_system_page_flags_ = 0;
 }
 
@@ -121,6 +151,10 @@ void SharedMemory::InvalidateAllPages() {
   std::memset(system_page_flags_valid_and_gpu_written_, 0,
               num_system_page_flags_ * sizeof(uint64_t));
   std::memset(system_page_flags_invalidated_in_submission_, 0xFF,
+              num_system_page_flags_ * sizeof(uint64_t));
+  std::memset(system_page_flags_refresh_only_, 0,
+              num_system_page_flags_ * sizeof(uint64_t));
+  std::memset(system_page_flags_content_hashed_, 0,
               num_system_page_flags_ * sizeof(uint64_t));
 
   // Mark all chunks dirty so the next copy refreshes everything.
@@ -197,8 +231,10 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
     if (dirty_count == 0 || dirty_count > 16) {
       for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
         uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
-        system_page_flags_invalidated_in_submission_[i] |=
+        uint64_t refreshed_block =
             system_page_flags_valid_[i] & ~gpu_written_block;
+        system_page_flags_invalidated_in_submission_[i] |= refreshed_block;
+        system_page_flags_refresh_only_[i] |= refreshed_block;
         system_page_flags_valid_[i] = gpu_written_block;
       }
     } else {
@@ -212,8 +248,10 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
         for (uint32_t i = entry_offset; i < entry_offset + 64; ++i) {
           uint64_t gpu_written_block =
               system_page_flags_valid_and_gpu_written_[i];
-          system_page_flags_invalidated_in_submission_[i] |=
+          uint64_t refreshed_block =
               system_page_flags_valid_[i] & ~gpu_written_block;
+          system_page_flags_invalidated_in_submission_[i] |= refreshed_block;
+          system_page_flags_refresh_only_[i] |= refreshed_block;
           system_page_flags_valid_[i] = gpu_written_block;
         }
       }
@@ -422,6 +460,10 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
       }
       // SystemPageFlagsBlock& block = system_page_flags_[i];
       system_page_flags_valid_[i] |= valid_bits;
+      // Whatever validated the pages - an upload or a GPU write - the bytes
+      // last recorded for them no longer describe the buffer. An upload
+      // records them again after this.
+      ForgetPageContentLocked(i, valid_bits);
       if (written_by_gpu) {
         system_page_flags_valid_and_gpu_written_[i] |= valid_bits;
         // Mark the touched chunk dirty so the next copy picks it up.
@@ -744,6 +786,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     system_page_flags_valid_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
     system_page_flags_invalidated_in_submission_[i] |= invalidate_bits;
+    // CPU-written (or unprotected for writing): must be uploaded for real.
+    ForgetPageContentLocked(i, invalidate_bits);
     // Track which chunks changed for partial copying.
     dirty_blocks_mask |= (1u << (i >> 6));
   }
@@ -779,6 +823,7 @@ void SharedMemory::PrepareForTraceDownload() {
     // Fire watches on the invalidated pages.
     uint64_t fire_watches_block = previously_valid_block & ~gpu_written_block;
     system_page_flags_invalidated_in_submission_[i] |= fire_watches_block;
+    ForgetPageContentLocked(i, fire_watches_block);
     uint64_t fire_watches_break_block = ~fire_watches_block;
     while (true) {
       uint32_t fire_watches_block_page;
@@ -906,6 +951,118 @@ bool SharedMemory::EnsureHostGpuMemoryAllocated(uint32_t start,
     return true;
   }
   return true;
+}
+
+bool SharedMemory::refresh_upload_tracking_enabled() const {
+  return cvars::clear_memory_page_state &&
+         (cvars::log_shared_memory_uploads ||
+          cvars::clear_memory_page_state_skip_unchanged);
+}
+
+bool SharedMemory::refresh_upload_skip_enabled() const {
+  // gpu_allow_invalid_upload_range may upload unreadable pages, which can't
+  // be hashed.
+  return cvars::clear_memory_page_state &&
+         cvars::clear_memory_page_state_skip_unchanged &&
+         !cvars::gpu_allow_invalid_upload_range;
+}
+
+void SharedMemory::SnapshotRefreshOnlyPages(
+    uint32_t page_first, uint32_t page_count, bool require_hash,
+    std::vector<uint64_t>& bits_out) const {
+  bits_out.assign((page_count + 63) / 64, 0);
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t i = 0; i < page_count; ++i) {
+    uint32_t page = page_first + i;
+    uint64_t bit = uint64_t(1) << (page & 63);
+    uint64_t flags = system_page_flags_refresh_only_[page >> 6];
+    if (require_hash) {
+      flags &= system_page_flags_content_hashed_[page >> 6];
+    }
+    if (flags & bit) {
+      bits_out[i >> 6] |= uint64_t(1) << (i & 63);
+    }
+  }
+}
+
+bool SharedMemory::PageMatchesUploadedContent(uint32_t page) const {
+  if (!page_content_hashes_) {
+    return false;
+  }
+  const uint8_t* data = memory_.TranslatePhysical<const uint8_t*>(
+      page << page_size_log2_);
+  return XXH3_64bits(data, size_t(1) << page_size_log2_) ==
+         page_content_hashes_[page];
+}
+
+void SharedMemory::RecordUploadedContent(uint32_t page_first,
+                                         uint32_t page_count,
+                                         const uint8_t* data) {
+  if (!refresh_upload_skip_enabled()) {
+    return;
+  }
+  if (!page_content_hashes_) {
+    page_content_hashes_ = std::make_unique<uint64_t[]>(
+        size_t(kBufferSize >> page_size_log2_));
+  }
+  const size_t page_size = size_t(1) << page_size_log2_;
+  // Hash outside the lock; the state bits only become set below, after
+  // every hash they vouch for is in place.
+  for (uint32_t i = 0; i < page_count; ++i) {
+    page_content_hashes_[page_first + i] =
+        XXH3_64bits(data + i * page_size, page_size);
+  }
+  KeepUploadedContent(page_first, page_count);
+}
+
+void SharedMemory::KeepUploadedContent(uint32_t page_first,
+                                       uint32_t page_count) {
+  if (!page_content_hashes_ || !page_count) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
+    system_page_flags_content_hashed_[page >> 6] |= uint64_t(1)
+                                                    << (page & 63);
+  }
+}
+
+void SharedMemory::ForgetUploadedContent(uint32_t page_first,
+                                         uint32_t page_count) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
+    ForgetPageContentLocked(page >> 6, uint64_t(1) << (page & 63));
+  }
+}
+
+void SharedMemory::OnFrameClosed() {
+  if (!cvars::log_shared_memory_uploads) {
+    return;
+  }
+  ++stat_frames_;
+  uint64_t now_ms = Clock::QueryHostUptimeMillis();
+  if (!stat_last_log_ms_) {
+    stat_last_log_ms_ = now_ms;
+    return;
+  }
+  if (now_ms - stat_last_log_ms_ < 1000) {
+    return;
+  }
+  const double frames = double(std::max(stat_frames_, uint32_t(1)));
+  constexpr double kKB = 1024.0;
+  XELOGI(
+      "SharedMemUploads: {} frames in {} ms, per frame: {:.1f} KB uploaded "
+      "({:.1f} KB of it refresh-only), {:.1f} KB refresh uploads skipped "
+      "as unchanged",
+      stat_frames_, now_ms - stat_last_log_ms_,
+      stat_uploaded_bytes_ / kKB / frames,
+      stat_refresh_uploaded_bytes_ / kKB / frames,
+      stat_refresh_skipped_bytes_ / kKB / frames);
+  stat_uploaded_bytes_ = 0;
+  stat_refresh_uploaded_bytes_ = 0;
+  stat_refresh_skipped_bytes_ = 0;
+  stat_frames_ = 0;
+  stat_last_log_ms_ = now_ms;
 }
 
 }  // namespace gpu
